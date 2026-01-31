@@ -1,29 +1,58 @@
 import asyncio
 import os
-import sys
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.strategy import FSMStrategy
+from typing import Tuple, Optional
+from dataclasses import dataclass
 
-# ---------- TOKEN SETUP ----------
-TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+# ---------- CONFIGURATION ----------
+TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
-    print("❌ Не установлен токен бота. Установите переменную окружения BOT_TOKEN.")
-    print("Пример: export BOT_TOKEN='ваш_токен' или создайте файл .env")
-    sys.exit(1)
+    raise ValueError(
+        "Не установлен токен бота. Установите переменную окружения BOT_TOKEN"
+    )
 
-# ---------- BOT INITIALIZATION ----------
 bot = Bot(
     token=TOKEN,
     default=DefaultBotProperties(parse_mode="HTML")
 )
+dp = Dispatcher(storage=MemoryStorage(), fsm_strategy=FSMStrategy.USER_IN_CHAT)
 
-dp = Dispatcher(storage=MemoryStorage())
+# ---------- DATA CLASSES ----------
+@dataclass
+class PositionData:
+    """Класс для хранения данных позиции"""
+    supply_ticker: str
+    borrow_ticker: str
+    supply_amount: float
+    supply_price: float
+    lt: float
+    max_ltv: float
+    ltv: Optional[float] = None
+    borrow: Optional[float] = None
+    
+    @property
+    def collateral_value(self) -> float:
+        return self.supply_amount * self.supply_price
+    
+    def get_ltv(self) -> float:
+        """Возвращает LTV в зависимости от режима"""
+        if self.ltv is not None:
+            return self.ltv
+        return self.borrow / self.collateral_value if self.collateral_value > 0 else 0
+    
+    def get_borrow_amount(self) -> float:
+        """Возвращает сумму займа в зависимости от режима"""
+        if self.borrow is not None:
+            return self.borrow
+        return self.collateral_value * self.ltv if self.ltv is not None else 0
 
 # ---------- STATES ----------
 class Calc(StatesGroup):
@@ -37,21 +66,35 @@ class Calc(StatesGroup):
     lt = State()
     max_ltv = State()
 
-# ---------- KEYBOARD ----------
+# ---------- KEYBOARDS ----------
 mode_kb = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="🔢 По LTV", callback_data="mode_ltv")],
     [InlineKeyboardButton(text="💵 По сумме займа", callback_data="mode_borrow")]
 ])
 
 # ---------- VALIDATION HELPERS ----------
-def validate_number(text: str, min_val: float = 0, max_val: float = None) -> tuple[bool, float, str]:
-    """Проверяет корректность числового ввода"""
+def validate_number(
+    text: str, 
+    min_val: float = 0, 
+    max_val: Optional[float] = None
+) -> Tuple[bool, float, str]:
+    """
+    Проверяет корректность числового ввода
+    
+    Args:
+        text: Текст для валидации
+        min_val: Минимальное допустимое значение
+        max_val: Максимальное допустимое значение (опционально)
+    
+    Returns:
+        Tuple[bool, float, str]: (валидно, значение, сообщение об ошибке)
+    """
     try:
-        text = text.replace(",", ".").strip().replace(" ", "")
+        text = text.replace(",", ".").strip()
         value = float(text)
         
-        if value < min_val:
-            return False, 0, f"Значение должно быть не меньше {min_val}"
+        if value <= min_val:
+            return False, 0, f"Значение должно быть больше {min_val}"
         if max_val is not None and value > max_val:
             return False, 0, f"Значение должно быть не больше {max_val}"
         
@@ -59,60 +102,136 @@ def validate_number(text: str, min_val: float = 0, max_val: float = None) -> tup
     except (ValueError, TypeError):
         return False, 0, "Пожалуйста, введите корректное число"
 
+def validate_ticker(text: str, max_length: int = 10) -> Tuple[bool, str, str]:
+    """
+    Проверяет корректность тикера
+    
+    Returns:
+        Tuple[bool, str, str]: (валидно, тикер, сообщение об ошибке)
+    """
+    ticker = text.upper().strip()
+    if len(ticker) > max_length:
+        return False, "", f"Тикер слишком длинный (max {max_length} символов)"
+    if not ticker.isalnum():
+        return False, "", "Тикер должен содержать только буквы и цифры"
+    return True, ticker, ""
+
+def format_currency(value: float) -> str:
+    """Форматирует денежные значения"""
+    if value >= 1_000_000:
+        return f"${value/1_000_000:.2f}M"
+    elif value >= 1_000:
+        return f"${value/1_000:.1f}K"
+    else:
+        return f"${value:.2f}"
+
+def format_number(value: float, decimals: int = 2) -> str:
+    """Форматирует числа с заданным количеством десятичных знаков"""
+    if value == float('inf'):
+        return "∞"
+    return f"{value:.{decimals}f}"
+
+# ---------- CALCULATION HELPERS ----------
+def calculate_health_factor(collateral: float, lt: float, borrow: float) -> float:
+    """Рассчитывает Health Factor"""
+    if borrow <= 0:
+        return float('inf')
+    return (collateral * lt) / borrow
+
+def calculate_liquidation_price(borrow: float, supply_amount: float, lt: float) -> float:
+    """Рассчитывает цену ликвидации"""
+    denominator = supply_amount * lt
+    if denominator <= 0:
+        return 0
+    return borrow / denominator
+
+def get_position_status(hf: float) -> Tuple[str, str]:
+    """
+    Определяет статус позиции по Health Factor
+    
+    Returns:
+        Tuple[str, str]: (статус с эмодзи, эмодзи)
+    """
+    if hf <= 1.0:
+        return "🔴 ЛИКВИДАЦИЯ", "🔴"
+    elif hf < 1.3:
+        return "🟡 ВНИМАНИЕ", "🟡"
+    elif hf < 2.0:
+        return "🟢 БЕЗОПАСНО", "🟢"
+    else:
+        return "🔵 ОЧЕНЬ БЕЗОПАСНО", "🔵"
+
 # ---------- COMMANDS ----------
 @dp.message(Command("start"))
 async def start_cmd(msg: types.Message, state: FSMContext):
-    """Начало работы с ботом"""
+    """Обработчик команды /start"""
     await state.clear()
     await msg.answer(
-        "<b>Калькулятор позиции DeFi</b>\n\n"
+        "<b>📊 Калькулятор позиции DeFi</b>\n\n"
         "Введите тикер залогового актива (например: ETH, SOL, BTC):"
     )
     await state.set_state(Calc.supply_ticker)
 
-@dp.message(Command("reset"))
+@dp.message(Command("reset", "отмена", "сброс"))
 async def reset_cmd(msg: types.Message, state: FSMContext):
-    """Сброс текущего расчета"""
+    """Обработчик команды сброса"""
     await state.clear()
-    await msg.answer("✅ Состояние сброшено. Используйте /start для начала расчета.")
-
-@dp.message(Command("help"))
-async def help_cmd(msg: types.Message):
-    """Помощь по использованию бота"""
     await msg.answer(
-        "<b>Помощь по боту:</b>\n\n"
-        "<b>Основные команды:</b>\n"
-        "/start - начать расчет позиции\n"
-        "/reset - сбросить текущий расчет\n"
-        "/help - показать это сообщение\n\n"
-        "<b>Как использовать:</b>\n"
-        "1. Укажите залоговый актив\n"
-        "2. Укажите заимствуемый актив\n"
-        "3. Введите количество и цену залога\n"
-        "4. Выберите режим расчета\n"
-        "5. Получите детальный анализ позиции"
+        "✅ Состояние сброшено.\n"
+        "Используйте /start для начала нового расчета."
     )
 
-# ---------- FLOW HANDLERS ----------
+@dp.message(Command("help", "помощь"))
+async def help_cmd(msg: types.Message):
+    """Обработчик команды помощи"""
+    await msg.answer(
+        "<b>📖 Помощь по боту</b>\n\n"
+        "<b>Команды:</b>\n"
+        "• /start - начать расчет позиции\n"
+        "• /reset - сбросить текущий расчет\n"
+        "• /help - показать это сообщение\n\n"
+        "<b>Что рассчитывает бот:</b>\n"
+        "• Health Factor (фактор здоровья позиции)\n"
+        "• Цену ликвидации\n"
+        "• Максимальный возможный займ\n"
+        "• Буфер безопасности\n"
+        "• Сценарии при падении цены на 10%, 20%, 30%\n\n"
+        "<b>Термины:</b>\n"
+        "• LTV (Loan-to-Value) - отношение займа к залогу\n"
+        "• LT (Liquidation Threshold) - порог ликвидации\n"
+        "• HF (Health Factor) - когда HF < 1, позиция ликвидируется"
+    )
+
+# ---------- STATE HANDLERS ----------
 @dp.message(Calc.supply_ticker)
 async def process_supply_ticker(msg: types.Message, state: FSMContext):
     """Обработка тикера залогового актива"""
-    ticker = msg.text.upper().strip()[:10]
+    valid, ticker, error = validate_ticker(msg.text)
+    
+    if not valid:
+        await msg.answer(f"❌ {error}\n\nПожалуйста, введите корректный тикер:")
+        return
+    
     await state.update_data(supply_ticker=ticker)
     await msg.answer(
-        f"Залоговый актив: <b>{ticker}</b>\n\n"
-        "Введите тикер заимствуемого актива (например: USDC, DAI):"
+        f"✅ Залоговый актив: <b>{ticker}</b>\n\n"
+        "Введите тикер заимствуемого актива (например: USDC, DAI, USDT):"
     )
     await state.set_state(Calc.borrow_ticker)
 
 @dp.message(Calc.borrow_ticker)
 async def process_borrow_ticker(msg: types.Message, state: FSMContext):
     """Обработка тикера заимствуемого актива"""
-    ticker = msg.text.upper().strip()[:10]
+    valid, ticker, error = validate_ticker(msg.text)
+    
+    if not valid:
+        await msg.answer(f"❌ {error}\n\nПожалуйста, введите корректный тикер:")
+        return
+    
     await state.update_data(borrow_ticker=ticker)
     await msg.answer(
-        f"Заимствуемый актив: <b>{ticker}</b>\n\n"
-        "Введите количество залогового актива (например: 1.5):"
+        f"✅ Заимствуемый актив: <b>{ticker}</b>\n\n"
+        "Введите количество залогового актива:"
     )
     await state.set_state(Calc.supply_amount)
 
@@ -126,9 +245,12 @@ async def process_supply_amount(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(supply_amount=value)
+    data = await state.get_data()
+    
     await msg.answer(
-        f"Количество: <b>{value:.6f}</b>\n\n"
-        "Введите цену залогового актива в USD (например: 3000):"
+        f"✅ Залоговый актив: <b>{data.get('supply_ticker')}</b>\n"
+        f"✅ Количество: <b>{value:.6f}</b>\n\n"
+        "Введите цену залогового актива в USD:"
     )
     await state.set_state(Calc.supply_price)
 
@@ -148,11 +270,11 @@ async def process_supply_price(msg: types.Message, state: FSMContext):
     collateral_value = supply_amount * value
     
     await msg.answer(
-        f"<b>📊 Предварительный расчет:</b>\n\n"
-        f"Залоговый актив: {data.get('supply_ticker')}\n"
+        f"<b>📊 Предварительный расчет</b>\n\n"
+        f"Залоговый актив: <b>{data.get('supply_ticker')}</b>\n"
         f"Количество: {supply_amount:.6f}\n"
         f"Цена: ${value:.2f}\n"
-        f"<b>Стоимость залога: ${collateral_value:.2f}</b>\n\n"
+        f"<b>💰 Стоимость залога: {format_currency(collateral_value)}</b>\n\n"
         "Выберите режим расчета:",
         reply_markup=mode_kb
     )
@@ -173,27 +295,30 @@ async def process_mode(cb: types.CallbackQuery, state: FSMContext):
     
     if mode == "mode_ltv":
         await cb.message.edit_text(
-            f"<b>Режим: Расчет по LTV</b>\n\n"
-            f"Стоимость залога: ${collateral_value:.2f}\n\n"
+            f"<b>🔢 Режим: Расчет по LTV</b>\n\n"
+            f"Стоимость залога: {format_currency(collateral_value)}\n\n"
             "Введите Loan-to-Value (LTV) в % (например: 50):"
         )
         await state.set_state(Calc.ltv)
-    else:
+    else:  # mode_borrow
         await cb.message.edit_text(
-            f"<b>Режим: Расчет по сумме займа</b>\n\n"
-            f"Стоимость залога: ${collateral_value:.2f}\n\n"
-            f"Доступно для займа: ${collateral_value:.2f}\n\n"
-            "Введите сумму займа:"
+            f"<b>💵 Режим: Расчет по сумме займа</b>\n\n"
+            f"Стоимость залога: {format_currency(collateral_value)}\n\n"
+            "Введите сумму займа в USD:"
         )
         await state.set_state(Calc.borrow)
 
 @dp.message(Calc.ltv)
 async def process_ltv(msg: types.Message, state: FSMContext):
     """Обработка LTV"""
-    valid, value, error = validate_number(msg.text, min_val=0.01, max_val=99.99)
+    valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     
     if not valid:
-        await msg.answer(f"❌ {error}\n\nLTV должен быть от 0.01 до 99.99%.\nВведите LTV (%):")
+        await msg.answer(
+            f"❌ {error}\n\n"
+            "LTV должен быть от 0 до 100%.\n"
+            "Введите LTV (%):"
+        )
         return
     
     await state.update_data(ltv=value / 100)
@@ -205,16 +330,16 @@ async def process_ltv(msg: types.Message, state: FSMContext):
     borrow_amount = collateral_value * (value / 100)
     
     await msg.answer(
-        f"<b>LTV: {value}%</b>\n"
-        f"Сумма займа: ${borrow_amount:.2f}\n\n"
-        "Введите Liquidation Threshold (LT) в %:"
+        f"✅ <b>LTV: {value}%</b>\n"
+        f"Сумма займа при таком LTV: {format_currency(borrow_amount)}\n\n"
+        "Введите Liquidation Threshold (LT) в % (например: 75):"
     )
     await state.set_state(Calc.lt)
 
 @dp.message(Calc.borrow)
 async def process_borrow(msg: types.Message, state: FSMContext):
     """Обработка суммы займа"""
-    valid, value, error = validate_number(msg.text, min_val=0.01)
+    valid, value, error = validate_number(msg.text, min_val=0)
     
     if not valid:
         await msg.answer(f"❌ {error}\n\nВведите сумму займа:")
@@ -227,8 +352,9 @@ async def process_borrow(msg: types.Message, state: FSMContext):
     
     if value > collateral_value:
         await msg.answer(
-            f"❌ Сумма займа (${value:.2f}) превышает стоимость залога (${collateral_value:.2f})\n\n"
-            "Введите корректную сумму:"
+            f"❌ Сумма займа ({format_currency(value)}) превышает "
+            f"стоимость залога ({format_currency(collateral_value)})\n\n"
+            "Введите корректную сумму займа:"
         )
         return
     
@@ -237,26 +363,30 @@ async def process_borrow(msg: types.Message, state: FSMContext):
     ltv_percent = (value / collateral_value) * 100 if collateral_value > 0 else 0
     
     await msg.answer(
-        f"<b>Сумма займа: ${value:.2f}</b>\n"
-        f"LTV: {ltv_percent:.1f}%\n\n"
-        "Введите Liquidation Threshold (LT) в %:"
+        f"✅ <b>Сумма займа: {format_currency(value)}</b>\n"
+        f"LTV при такой сумме: {ltv_percent:.1f}%\n\n"
+        "Введите Liquidation Threshold (LT) в % (например: 75):"
     )
     await state.set_state(Calc.lt)
 
 @dp.message(Calc.lt)
 async def process_lt(msg: types.Message, state: FSMContext):
     """Обработка Liquidation Threshold"""
-    valid, value, error = validate_number(msg.text, min_val=0.01, max_val=99.99)
+    valid, value, error = validate_number(msg.text, min_val=0, max_val=100)
     
     if not valid:
-        await msg.answer(f"❌ {error}\n\nLT должен быть от 0.01 до 99.99%.\nВведите LT (%):")
+        await msg.answer(
+            f"❌ {error}\n\n"
+            "LT должен быть от 0 до 100%.\n"
+            "Введите LT (%):"
+        )
         return
     
     await state.update_data(lt=value / 100)
     
     await msg.answer(
-        f"<b>Liquidation Threshold: {value}%</b>\n\n"
-        "Введите Maximum LTV в %:"
+        f"✅ <b>Liquidation Threshold: {value}%</b>\n\n"
+        "Введите Maximum LTV в % (например: 65):"
     )
     await state.set_state(Calc.max_ltv)
 
@@ -266,7 +396,7 @@ async def calculate_position(msg: types.Message, state: FSMContext):
     """Основной расчет позиции"""
     try:
         # Валидация Max LTV
-        valid, max_ltv_input, error = validate_number(msg.text, min_val=0.01, max_val=99.99)
+        valid, max_ltv_input, error = validate_number(msg.text, min_val=0, max_val=100)
         if not valid:
             await msg.answer(f"❌ {error}\n\nВведите Maximum LTV (%):")
             return
@@ -277,11 +407,12 @@ async def calculate_position(msg: types.Message, state: FSMContext):
         data = await state.get_data()
         
         # Проверяем обязательные поля
-        required_fields = ['supply_amount', 'supply_price', 'lt', 'mode']
+        required_fields = ['supply_ticker', 'borrow_ticker', 'supply_amount', 
+                          'supply_price', 'lt', 'mode']
         missing_fields = [field for field in required_fields if field not in data]
         if missing_fields:
             await msg.answer(
-                f"❌ Отсутствуют данные\n\n"
+                f"❌ Отсутствуют данные: {', '.join(missing_fields)}\n\n"
                 "Пожалуйста, начните заново с /start"
             )
             await state.clear()
@@ -298,137 +429,181 @@ async def calculate_position(msg: types.Message, state: FSMContext):
         
         # Рассчитываем займ и LTV в зависимости от режима
         if mode == "mode_ltv":
-            ltv = data.get('ltv', 0)
+            if 'ltv' not in data:
+                await msg.answer("❌ Отсутствует LTV\n\nНачните заново с /start")
+                await state.clear()
+                return
+            
+            ltv = data['ltv']
             borrow = collateral * ltv
-            ltv_percent = ltv * 100
-        else:
-            borrow = data.get('borrow', 0)
+        else:  # mode_borrow
+            if 'borrow' not in data:
+                await msg.answer("❌ Отсутствует сумма займа\n\nНачните заново с /start")
+                await state.clear()
+                return
+            
+            borrow = data['borrow']
             ltv = borrow / collateral if collateral > 0 else 0
-            ltv_percent = ltv * 100
         
-        # Проверяем валидность данных
+        ltv_percent = ltv * 100
+        
+        # Валидация параметров
         if ltv > max_ltv:
             await msg.answer(
-                f"❌ LTV ({ltv_percent:.1f}%) превышает Maximum LTV ({max_ltv_input}%)\n\n"
-                "Начните заново с /start"
+                f"❌ Текущий LTV ({ltv_percent:.1f}%) превышает "
+                f"Maximum LTV ({max_ltv_input}%)\n\n"
+                "Пожалуйста, скорректируйте параметры или начните заново с /start"
             )
-            await state.clear()
             return
         
         if lt <= ltv:
             await msg.answer(
-                f"❌ LT ({lt*100:.1f}%) должен быть больше LTV ({ltv_percent:.1f}%)\n\n"
-                "Начните заново с /start"
+                f"❌ Liquidation Threshold ({lt*100:.1f}%) должен быть больше "
+                f"LTV ({ltv_percent:.1f}%)\n\n"
+                "Пожалуйста, скорректируйте параметры или начните заново с /start"
             )
-            await state.clear()
             return
         
         # Основные расчеты
-        hf = (collateral * lt) / borrow if borrow > 0 else float('inf')
-        liquidation_price = borrow / (supply_amt * lt) if (supply_amt * lt) > 0 else 0
+        hf = calculate_health_factor(collateral, lt, borrow)
+        liquidation_price = calculate_liquidation_price(borrow, supply_amt, lt)
         max_borrow = collateral * max_ltv
-        buffer = ((price - liquidation_price) / price) * 100 if price > 0 and liquidation_price > 0 else 0
+        buffer = ((price - liquidation_price) / price) * 100 if price > 0 else 0
         
-        # Сценарии изменения цены
-        price_changes = [-10, -20, -30]
+        # Сценарии падения цены
         scenarios = []
-        
-        for change in price_changes:
-            new_price = price * (1 + change/100)
-            if borrow > 0:
-                new_hf = (supply_amt * new_price * lt) / borrow
-            else:
-                new_hf = float('inf')
-            
-            if new_hf <= 1.0:
-                emoji = "🔴"
-            elif new_hf < 1.3:
-                emoji = "🟡"
-            else:
-                emoji = "🟢"
-            
-            scenarios.append(f"{change}% → {emoji} HF {new_hf:.2f}")
+        for drop_percent in [10, 20, 30]:
+            new_price = price * (1 - drop_percent / 100)
+            new_collateral = supply_amt * new_price
+            scenario_hf = calculate_health_factor(new_collateral, lt, borrow)
+            scenarios.append((drop_percent, scenario_hf))
         
         # Определяем статус позиции
-        if hf <= 1.0:
-            status = "🔴 ЛИКВИДАЦИЯ"
-        elif hf < 1.3:
-            status = "🟡 ВНИМАНИЕ"
-        elif hf < 2.0:
-            status = "🟢 БЕЗОПАСНО"
-        else:
-            status = "🔵 ОЧЕНЬ БЕЗОПАСНО"
+        status, status_emoji = get_position_status(hf)
         
         # Формируем ответ
-        result_message = (
-            f"<b>📊 РАСЧЕТ ПОЗИЦИИ</b>\n\n"
-            
-            f"<b>Залог:</b>\n"
-            f"• Актива: {data.get('supply_ticker', '—')}\n"
-            f"• Количество: {supply_amt:.6f}\n"
-            f"• Цена: ${price:.2f}\n"
-            f"• Стоимость: <b>${collateral:.2f}</b>\n\n"
-            
-            f"<b>Займ:</b>\n"
-            f"• Актива: {data.get('borrow_ticker', '—')}\n"
-            f"• Сумма: <b>${borrow:.2f}</b>\n\n"
-            
-            f"<b>Параметры:</b>\n"
-            f"• LTV: <b>{ltv_percent:.2f}%</b>\n"
-            f"• Max LTV: {max_ltv_input}%\n"
-            f"• LT: {lt*100:.1f}%\n\n"
-            
-            f"<b>Риски:</b>\n"
-            f"• Health Factor: <b>{hf:.2f}</b> ({status})\n"
-            f"• Цена ликвидации: <b>${liquidation_price:.2f}</b>\n"
-            f"• Буфер: <b>{buffer:.1f}%</b>\n"
-            f"• Max займ: ${max_borrow:.2f}\n\n"
-            
-            f"<b>Сценарии:</b>\n" + "\n".join([f"• {s}" for s in scenarios])
+        result_message = build_result_message(
+            status_emoji, status,
+            data.get('supply_ticker', 'N/A'),
+            data.get('borrow_ticker', 'N/A'),
+            supply_amt, price, collateral,
+            borrow, ltv_percent, max_ltv_input, lt,
+            hf, liquidation_price, buffer, max_borrow,
+            scenarios
         )
         
+        # Добавляем рекомендации при необходимости
+        if hf < 1.3:
+            result_message += (
+                "\n\n<b>⚠️ РЕКОМЕНДАЦИИ:</b>\n"
+                "• Увеличьте залог для повышения Health Factor\n"
+                "• Уменьшите сумму займа\n"
+                "• Подготовьте средства для пополнения залога\n"
+                "• Установите алерты на изменение цены актива"
+            )
+        
         await msg.answer(result_message)
-        await msg.answer("Для нового расчета используйте /start")
+        
+        # Предлагаем начать новый расчет
+        await msg.answer(
+            "📝 Для нового расчета используйте /start\n"
+            "ℹ️ Для помощи - /help"
+        )
         
         await state.clear()
         
+    except ZeroDivisionError:
+        await msg.answer(
+            "❌ Ошибка: деление на ноль. Проверьте введенные данные.\n"
+            "Используйте /start для нового расчета."
+        )
+        await state.clear()
     except Exception as e:
-        await msg.answer(f"❌ Ошибка: {str(e)}\n\nНачните заново с /start")
+        await msg.answer(
+            f"❌ Произошла ошибка: {str(e)}\n\n"
+            "Пожалуйста, начните заново с /start"
+        )
         await state.clear()
+
+def build_result_message(
+    status_emoji: str, status: str,
+    supply_ticker: str, borrow_ticker: str,
+    supply_amt: float, price: float, collateral: float,
+    borrow: float, ltv_percent: float, max_ltv_input: float, lt: float,
+    hf: float, liquidation_price: float, buffer: float, max_borrow: float,
+    scenarios: list
+) -> str:
+    """Формирует итоговое сообщение с результатами расчета"""
+    
+    return (
+        f"<b>{status_emoji} РАСЧЕТ ПОЗИЦИИ</b>\n"
+        f"Статус: <b>{status}</b>\n\n"
+        
+        f"<b>💎 ЗАЛОГ:</b>\n"
+        f"• Актив: {supply_ticker}\n"
+        f"• Количество: {supply_amt:.6f}\n"
+        f"• Цена: ${price:.2f}\n"
+        f"• Стоимость: <b>{format_currency(collateral)}</b>\n\n"
+        
+        f"<b>💰 ЗАЙМ:</b>\n"
+        f"• Актив: {borrow_ticker}\n"
+        f"• Сумма: <b>{format_currency(borrow)}</b>\n\n"
+        
+        f"<b>⚙️ ПАРАМЕТРЫ:</b>\n"
+        f"• Current LTV: <b>{ltv_percent:.2f}%</b>\n"
+        f"• Maximum LTV: {max_ltv_input}%\n"
+        f"• Liquidation Threshold: {lt*100:.1f}%\n\n"
+        
+        f"<b>📊 РИСКИ:</b>\n"
+        f"• Health Factor: <b>{format_number(hf, 2)}</b>\n"
+        f"• Цена ликвидации: <b>${liquidation_price:.2f}</b>\n"
+        f"• Буфер безопасности: <b>{buffer:.1f}%</b>\n"
+        f"• Макс. возможный займ: {format_currency(max_borrow)}\n\n"
+        
+        f"<b>📉 СЦЕНАРИИ (падение цены):</b>\n"
+        + "\n".join([
+            f"• -{drop}% (${price * (1 - drop/100):.2f}) → HF: {format_number(scenario_hf, 2)}"
+            for drop, scenario_hf in scenarios
+        ])
+    )
 
 # ---------- FALLBACK HANDLER ----------
 @dp.message()
 async def fallback_handler(msg: types.Message, state: FSMContext):
-    """Обработчик других сообщений"""
+    """Обработчик любых других сообщений"""
     current_state = await state.get_state()
     
     if current_state:
         await msg.answer(
-            "⚠️ Следуйте инструкциям выше или используйте /reset для отмены."
+            "⚠️ Пожалуйста, следуйте инструкциям выше.\n"
+            "Используйте /reset для отмены текущего расчета."
         )
     else:
         await msg.answer(
-            "Для начала расчета используйте /start\n"
-            "Для помощи — /help"
+            "👋 Привет! Я помогу рассчитать параметры вашей DeFi позиции.\n\n"
+            "Используйте /start для начала расчета\n"
+            "Или /help для получения справки"
         )
 
-# ---------- MAIN ----------
+# ---------- ERROR HANDLING ----------
+@dp.error()
+async def error_handler(event, exception):
+    """Глобальный обработчик ошибок"""
+    print(f"❌ Ошибка: {exception}")
+    return True
+
+# ---------- RUN ----------
 async def main():
-    """Запуск бота"""
+    """Основная функция запуска бота"""
     print("=" * 50)
     print("🚀 DeFi Position Calculator Bot")
     print("=" * 50)
+    print("✅ Бот успешно запущен")
+    print("ℹ️  Нажмите Ctrl+C для остановки")
+    print("=" * 50)
     
     try:
-        me = await bot.get_me()
-        print(f"✅ Бот подключен: @{me.username}")
-        print(f"📛 Имя: {me.first_name}")
-        print("\n🤖 Бот запущен. Для остановки нажмите Ctrl+C")
-        print("=" * 50)
-        
-        await dp.start_polling(bot)
-    except Exception as e:
-        print(f"❌ Ошибка запуска: {e}")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()
 
@@ -436,4 +611,8 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Бот остановлен")
+        print("\n" + "=" * 50)
+        print("👋 Бот остановлен пользователем")
+        print("=" * 50)
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
