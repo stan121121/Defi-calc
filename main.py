@@ -1,5 +1,6 @@
 import asyncio
 import os
+from aiogram.client.default import DefaultBotProperties
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.state import StatesGroup, State
@@ -10,12 +11,16 @@ from aiogram.fsm.strategy import FSMStrategy
 from decimal import Decimal, ROUND_DOWN
 
 # Получаем токен из переменных окружения
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = ("8304350198:AAHqoOVDdHZVVz6xOBIg5kEs9SvvhCJlguE")
 
 if not TOKEN:
     raise ValueError(
-        "Не установлен токен бота. Установите переменную окружения BOT_TOKEN")
-bot = Bot(token=TOKEN, parse_mode="HTML")
+        "Не установлен токен бота. Установите переменную окружения 8304350198:AAHqoOVDdHZVVz6xOBIg5kEs9SvvhCJlguE")
+
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode="HTML")
+)
 dp = Dispatcher(storage=MemoryStorage(), fsm_strategy=FSMStrategy.USER_IN_CHAT)
 
 # ---------- STATES ----------
