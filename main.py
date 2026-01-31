@@ -10,10 +10,11 @@ from aiogram.fsm.strategy import FSMStrategy
 from decimal import Decimal, ROUND_DOWN
 
 # Получаем токен из переменных окружения
-TOKEN = os.getenv("PASTE_YOUR_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("Не установлен токен бота. Установите переменную окружения PASTE_YOUR_BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 
+if not TOKEN:
+    raise ValueError(
+        "Не установлен токен бота. Установите переменную окружения BOT_TOKEN")
 bot = Bot(token=TOKEN, parse_mode="HTML")
 dp = Dispatcher(storage=MemoryStorage(), fsm_strategy=FSMStrategy.USER_IN_CHAT)
 
