@@ -1,3 +1,5 @@
+[file name]: main.py
+[file content begin]
 """
 =============================================================================
 DeFi Position Calculator Bot - Финальная версия v2.2
@@ -591,7 +593,8 @@ async def process_supply_ticker(msg: types.Message, state: FSMContext):
         return
     
     await state.update_data(supply_ticker=ticker)
-    is_supported = price_fetcher.is_supported(ticker)
+    # ИСПРАВЛЕНО: заменил price_fetcher на coingecko_fetcher
+    is_supported = coingecko_fetcher.is_supported(ticker)
     
     await msg.answer(
         f"✅ <b>Залоговый актив:</b> {ticker}\n"
@@ -1018,6 +1021,7 @@ async def fallback_handler(msg: types.Message, state: FSMContext):
         await msg.answer("👋 Привет! Используйте /start для начала расчета")
 
 
+# ИСПРАВЛЕНО: добавлен второй аргумент exception
 @dp.error()
 async def error_handler(event, exception):
     """Глобальный обработчик ошибок"""
@@ -1077,3 +1081,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
+[file content end]
