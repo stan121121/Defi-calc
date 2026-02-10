@@ -372,7 +372,7 @@ async def start_cmd(msg: types.Message, state: FSMContext):
         f"✅ Ручной ввод (любые токены)\n\n"
         
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Введите <b>тикер залогового актива</b>\n"
+        "Введите <b>тикер Supply актива</b>\n"
         "(например: ETH, BTC, SOL)"
     )
     await state.set_state(Calc.supply_ticker)
@@ -433,9 +433,10 @@ async def process_supply_ticker(msg: types.Message, state: FSMContext):
     await state.update_data(supply_ticker=ticker)
     
     await msg.answer(
-        f"✅ <b>Залоговый актив:</b> {ticker}\n\n"
+        f"✅ <b>Supply актив:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Введите <b>тикер заимствуемого актива</b>"
+        "Введите <b>тикер Borrow актива</b>"
+        "(например: USDC, USDT, PYUSD)"
     )
     await state.set_state(Calc.borrow_ticker)
 
@@ -450,7 +451,7 @@ async def process_borrow_ticker(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     
     await msg.answer(
-        f"✅ <b>Заимствуемый актив:</b> {ticker}\n\n"
+        f"✅ <b>Borrow актив:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"Введите <b>количество {data['supply_ticker']}</b>"
     )
@@ -880,4 +881,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 До свидания!")
-
