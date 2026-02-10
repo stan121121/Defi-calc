@@ -436,7 +436,7 @@ async def process_supply_ticker(msg: types.Message, state: FSMContext):
         f"✅ <b>Supply актив:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Введите <b>тикер Borrow актива</b>"
-        "(например: USDC, USDT, PYUSD)"
+        "(например: USDC, USDT, USDs)"
     )
     await state.set_state(Calc.borrow_ticker)
 
