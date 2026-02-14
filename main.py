@@ -372,7 +372,7 @@ async def start_cmd(msg: types.Message, state: FSMContext):
     cmc_status = "✅" if cmc_fetcher.is_available() else "❌"
     
     await msg.answer(
-        "🤖 <b>DeFi Position Calculator</b>\n"
+        "🤖 <b>DeFi Risk.calc </b>\n"
         "<i>DeFi lending position calculator</i>\n\n"
         
         f"<b>📡 Price sources:</b>\n"
@@ -380,7 +380,7 @@ async def start_cmd(msg: types.Message, state: FSMContext):
         f"✅ Manual input (any tokens)\n\n"
         
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Enter <b>collateral asset ticker</b>\n"
+        "Enter <b>Supply asset ticker</b>\n"
         "(e.g., ETH, BTC, SOL)"
     )
     await state.set_state(Calc.supply_ticker)
@@ -442,9 +442,10 @@ async def process_supply_ticker(msg: types.Message, state: FSMContext):
     await state.update_data(supply_ticker=ticker)
     
     await msg.answer(
-        f"✅ <b>Collateral asset:</b> {ticker}\n\n"
+        f"✅ <b>Supply asset:</b> {ticker}\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "Enter <b>borrow asset ticker</b>"
+        "Enter <b>borrow asset ticker</b>\n"
+        "(e.g., USDC, USDT, PYUSD)"
     )
     await state.set_state(Calc.borrow_ticker)
 
